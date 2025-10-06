@@ -16,6 +16,9 @@ from torch.utils.data import Dataset
 __all__ = ["MyDataset", "DatasetConfig"]
 
 
+VALID_DATASET_MODES = {"train", "validation", "test"}
+
+
 @dataclass(frozen=True)
 class DatasetConfig:
     """Configuration describing how to construct :class:`MyDataset`."""
@@ -33,6 +36,32 @@ class DatasetConfig:
     sparsify_threshold: float = 0.3
     log_eps: float = 1e-12
     norm_eps: float = 1e-6
+
+    def __post_init__(self) -> None:
+        if not self.root:
+            raise ValueError("root directory must be provided")
+        if not self.dest:
+            raise ValueError("destination directory must be provided")
+        if not self.tickers:
+            raise ValueError("tickers list may not be empty")
+        if self.window <= 1:
+            raise ValueError("window must be greater than one to compute labels")
+
+        try:
+            start_ts = pd.to_datetime(self.start).normalize()
+            end_ts = pd.to_datetime(self.end).normalize()
+        except (TypeError, ValueError) as exc:  # pragma: no cover - defensive guard
+            raise ValueError("start and end must be parseable as dates") from exc
+
+        if start_ts > end_ts:
+            raise ValueError("start date must be earlier than or equal to end date")
+
+        mode = self.mode.lower()
+        if mode not in VALID_DATASET_MODES:
+            allowed = ", ".join(sorted(VALID_DATASET_MODES))
+            raise ValueError(f"mode must be one of: {allowed}")
+
+        object.__setattr__(self, "mode", mode)
 
 
 class MyDataset(Dataset[Dict[str, Tensor]]):

@@ -42,10 +42,25 @@ class GeneralizedGraphDiffusion(nn.Module):
 
         self._validate_inputs(theta, bases, features, adjacency)
 
-        diffusion_kernel = torch.einsum("s,sij->ij", theta, bases)
-        diffusion_kernel = diffusion_kernel * adjacency
+        device = features.device
+        if adjacency.device != device:
+            raise ValueError("features and adjacency must reside on the same device")
+        if bases.device != device or theta.device != device:
+            raise ValueError("Diffusion parameters must reside on the same device as inputs")
 
-        diffused = torch.sparse.mm(diffusion_kernel.to_sparse().coalesce(), features)
+        diffusion_kernel = torch.einsum("s,sij->ij", theta, bases)
+
+        if adjacency.layout == torch.strided:
+            adjacency_matrix = adjacency
+        else:
+            adjacency_matrix = adjacency.to_dense()
+
+        dtype = features.dtype
+        diffusion_kernel = diffusion_kernel.to(dtype)
+        adjacency_matrix = adjacency_matrix.to(dtype)
+        diffused = (diffusion_kernel * adjacency_matrix) @ features.to(dtype)
+        diffused = diffused.to(dtype)
+
         activated = self.activation(diffused)
         return self.fc(activated)
 
