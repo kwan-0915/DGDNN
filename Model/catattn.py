@@ -1,8 +1,11 @@
 """Concatenation-based multi-head attention utilities."""
 
+from __future__ import annotations
+
 import torch
-import torch.nn as nn
-from torch import Tensor
+from torch import Tensor, nn
+
+__all__ = ["CatMultiAttn"]
 
 
 class CatMultiAttn(nn.Module):
@@ -42,7 +45,9 @@ class CatMultiAttn(nn.Module):
 
         # Multi-head attention treats every node as a token; the actual batch size
         # is handled by temporarily unsqueezing the sequence tensor.
-        self.attn = nn.MultiheadAttention(embed_dim=input_time, num_heads=num_heads)
+        self.attn = nn.MultiheadAttention(
+            embed_dim=input_time, num_heads=num_heads, batch_first=False
+        )
         self.norm = nn.LayerNorm(input_time)
 
         # Projection from the concatenated representation to the downstream space.

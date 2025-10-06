@@ -1,11 +1,12 @@
 """Dynamic Graph Diffusion Neural Network building blocks."""
 
+from __future__ import annotations
+
 from typing import Sequence
 
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from torch import Tensor
+from torch import Tensor, nn
+from torch.nn import functional as F
 
 if __package__ in (None, ""):
     from ggd import GeneralizedGraphDiffusion  # type: ignore
@@ -13,6 +14,8 @@ if __package__ in (None, ""):
 else:  # pragma: no cover - executed only when imported as a package
     from .ggd import GeneralizedGraphDiffusion
     from .catattn import CatMultiAttn
+
+__all__ = ["DGDNN"]
 
 
 class DGDNN(nn.Module):
@@ -95,17 +98,15 @@ class DGDNN(nn.Module):
         nn.init.xavier_uniform_(self.T)
         nn.init.constant_(self.theta, 1.0 / float(self.theta.size(-1)))
         nn.init.xavier_uniform_(self.linear.weight)
+        nn.init.xavier_uniform_(self.raw_h_prime.weight)
         if self.linear.bias is not None:
             nn.init.zeros_(self.linear.bias)
+        if self.raw_h_prime.bias is not None:
+            nn.init.zeros_(self.raw_h_prime.bias)
 
     def forward(self, X: Tensor, A: Tensor) -> Tensor:
-        """
-        Args:
-            X: [N, F0]  node features
-            A: [N, N]   adjacency matrix
-        Returns:
-            logits: [N, classes]
-        """
+        """Run the Dynamic Graph Diffusion Neural Network forward pass."""
+
         if X.dim() != 2 or A.dim() != 2:
             raise ValueError("X and A must both be 2-D tensors")
         if A.size(0) != A.size(1):
@@ -113,7 +114,7 @@ class DGDNN(nn.Module):
         if A.size(0) != X.size(0):
             raise ValueError("Adjacency size must match the number of nodes in X")
 
-        theta_soft = F.softmax(self.theta, dim=-1)  # [layers, expansion_step]
+        theta_soft = F.softmax(self.theta, dim=-1)
 
         h = X
         h_prime = X
