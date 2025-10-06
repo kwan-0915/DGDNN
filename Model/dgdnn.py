@@ -19,7 +19,7 @@ __all__ = ["DGDNN"]
 
 
 class DGDNN(nn.Module):
-    """Dynamic Graph Diffusion Neural Network.
+    """Decoupled Graph Diffusion Neural Network.
 
     The network alternates between diffusion layers, which propagate information
     over learned diffusion bases, and attention layers, which fuse the diffused
