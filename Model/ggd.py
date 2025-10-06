@@ -1,35 +1,66 @@
+"""Generalized graph diffusion operators."""
+
 import torch
 import torch.nn as nn
 from torch import Tensor
 
+
 class GeneralizedGraphDiffusion(nn.Module):
-    def __init__(self, input_dim: int, output_dim: int, active: bool):
+    """Compute diffused node embeddings over learned diffusion bases."""
+
+    def __init__(self, input_dim: int, output_dim: int, active: bool) -> None:
         super().__init__()
-        # Linear projection from input features to output features
         self.fc = nn.Linear(input_dim, output_dim)
-        # Pre-activation: PReLU with one parameter per channel if active
         self.activation = nn.PReLU(num_parameters=input_dim) if active else nn.Identity()
+
+    @staticmethod
+    def _validate_inputs(
+        theta: Tensor, T_slices: Tensor, x: Tensor, a: Tensor
+    ) -> None:
+        if theta.dim() != 1:
+            raise ValueError("theta must be a 1-D tensor of diffusion coefficients")
+        if T_slices.dim() != 3:
+            raise ValueError("T_slices must be a 3-D tensor [S, N, N]")
+        if x.dim() != 2:
+            raise ValueError("x must be a 2-D tensor of node features")
+        if a.dim() != 2 or a.size(0) != a.size(1):
+            raise ValueError("Adjacency tensor a must be square")
+        if T_slices.size(0) != theta.size(0):
+            raise ValueError("Number of diffusion bases must match the coefficients")
+        if T_slices.size(1) != a.size(0):
+            raise ValueError("Diffusion bases and adjacency must share node dimension")
+        if x.size(0) != a.size(0):
+            raise ValueError("Node feature count must match adjacency size")
 
     def forward(
         self,
-        theta: Tensor,        # [S] diffusion coefficients
-        T_slices: Tensor,     # [S, N, N] diffusion bases
-        x: Tensor,            # [N, F_in] node features
-        a: Tensor             # [N, N] adjacency weights
-    ) -> Tensor:             # [N, F_out]
-        # Combine diffusion bases via learned coefficients
-        q = torch.einsum('s,sij->ij', theta, T_slices)  # [N, N]
-        # Mask by adjacency
-        q = q * a                                      # [N, N]
+        theta: Tensor,
+        T_slices: Tensor,
+        x: Tensor,
+        a: Tensor,
+    ) -> Tensor:
+        """Apply the generalized diffusion operator.
 
-        # Convert to sparse and perform sparse-dense multiplication
+        Args:
+            theta: ``[S]`` diffusion coefficients.
+            T_slices: ``[S, N, N]`` diffusion bases.
+            x: ``[N, F_in]`` node features.
+            a: ``[N, N]`` adjacency weights.
+
+        Returns:
+            ``[N, F_out]`` tensor with diffused node representations.
+        """
+
+        self._validate_inputs(theta, T_slices, x, a)
+
+        q = torch.einsum("s,sij->ij", theta, T_slices)
+        q = q * a
+
         q_sparse = q.to_sparse().coalesce()
-        out = torch.sparse.mm(q_sparse, x)            # [N, F_in]
+        out = torch.sparse.mm(q_sparse, x)
 
-        # Apply activation and final linear layer
         out = self.activation(out)
-        out = self.fc(out)                            # [N, F_out]
-        return out
+        return self.fc(out)
 
 # Fast approximation version using GCNConv for efficiency
 # from torch_geometric.nn import GCNConv
