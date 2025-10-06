@@ -1,182 +1,257 @@
+"""Utilities for constructing rolling-window financial graph datasets."""
+
+from __future__ import annotations
+
 import os
-import torch
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional
+
 import numpy as np
 import pandas as pd
-from torch.utils.data import Dataset
+import torch
 from scipy.linalg import expm
+from torch import Tensor
+from torch.utils.data import Dataset
+
+__all__ = ["MyDataset", "DatasetConfig"]
 
 
-class MyDataset(Dataset):
+@dataclass(frozen=True)
+class DatasetConfig:
+    """Configuration describing how to construct :class:`MyDataset`."""
+
+    root: str
+    dest: str
+    market: str
+    tickers: List[str]
+    start: str
+    end: str
+    window: int
+    mode: str = "train"
+    fast_approx: bool = False
+    heat_tau: float = 5.0
+    sparsify_threshold: float = 0.3
+    log_eps: float = 1e-12
+    norm_eps: float = 1e-6
+
+
+class MyDataset(Dataset[Dict[str, Tensor]]):
+    """PyTorch dataset producing serialized rolling-window financial graphs.
+
+    Each sample corresponds to a contiguous window of :math:`T` trading days for
+    a set of companies.  The companies are represented as nodes in a graph whose
+    adjacency is derived from the statistical similarity of their windowed
+    feature trajectories.  The target label indicates whether the closing price
+    of each company increased on the following day.
     """
-    A PyTorch Dataset for rolling-window graphs of company time series.
 
-    Parameters:
-      - root (str): directory containing CSVs named {market}_{ticker}_30Y.csv
-      - dest (str): output directory for serialized graphs
-      - market (str): market code prefix in filenames (e.g., 'NASDAQ')
-      - tickers (list[str]): list of ticker symbols to include as nodes (e.g., ['AAPL','MSFT'])
-      - start (str): inclusive window start date 'YYYY-MM-DD'
-      - end (str): inclusive window end date 'YYYY-MM-DD'
-      - window (int): number of past days T to use per graph
-      - mode (str, optional): subfolder label, e.g. 'train' or 'test' (default 'train')
-      - fast_approx (bool, optional): whether to use heat-kernel approximation (default False)
-      - heat_tau (float, optional): time parameter for heat kernel (default 5.0)
-      - sparsify_threshold (float, optional): threshold for sparsification (default 0.3)
-      - log_eps (float, optional): epsilon added before log (default 1e-12)
-      - norm_eps (float, optional): epsilon added for numeric stability in z-score (default 1e-6)
+    feature_columns: List[str] = ["Open", "High", "Low", "Close", "Volume"]
 
-    Graph dict entries:
-      - X: Tensor [N, F * T] node features (log1p normalized)
-      - A: Tensor [N, N] adjacency matrix (entropy-energy or heat-kernel)
-      - Y: Tensor [N] integer labels (days price rose in window)
-    """
-    def __init__(
-        self,
-        root: str,
-        dest: str,
-        market: str,
-        tickers: list[str],
-        start: str,
-        end: str,
-        window: int,
-        mode: str = 'train',
-        fast_approx: bool = False,
-        heat_tau: float = 5.0,
-        sparsify_threshold: float = 0.3,
-        log_eps: float = 1e-12,
-        norm_eps: float = 1e-6,
-    ):
+    def __init__(self, config: Optional[DatasetConfig] = None, **kwargs: Any) -> None:
         super().__init__()
-        self.root = root
-        self.dest = dest
-        self.market = market
-        self.tickers = tickers
-        self.start = pd.to_datetime(start)
-        self.end = pd.to_datetime(end)
-        self.window = window
-        self.mode = mode
-        self.fast_approx = fast_approx
-        self.heat_tau = heat_tau
-        self.sparsify_threshold = sparsify_threshold
-        self.log_eps = log_eps
-        self.norm_eps = norm_eps
 
-        # Load data_frames_full & in-range slice
-        self.data_frames_full = {}
-        self.data_frames = {}
-        for t in self.tickers:
-            path = os.path.join(root, f"{market}_{t}_30Y.csv")
+        if config is None:
+            config = DatasetConfig(**kwargs)
+
+        self.root = config.root
+        self.dest = config.dest
+        self.market = config.market
+        self.tickers = list(config.tickers)
+        self.start = pd.to_datetime(config.start).normalize()
+        self.end = pd.to_datetime(config.end).normalize()
+        self.window = int(config.window)
+        self.mode = config.mode
+        self.fast_approx = config.fast_approx
+        self.heat_tau = float(config.heat_tau)
+        self.sparsify_threshold = float(config.sparsify_threshold)
+        self.log_eps = float(config.log_eps)
+        self.norm_eps = float(config.norm_eps)
+
+        if self.window <= 1:
+            raise ValueError("window must be greater than one to compute labels")
+        if not self.tickers:
+            raise ValueError("tickers list may not be empty")
+
+        self.data_frames_full: Dict[str, pd.DataFrame] = {}
+        self.data_frames: Dict[str, pd.DataFrame] = {}
+
+        for ticker in self.tickers:
+            path = os.path.join(self.root, f"{self.market}_{ticker}_30Y.csv")
             if not os.path.exists(path):
-                raise FileNotFoundError(f"CSV file for ticker {t} not found at {path}")
+                raise FileNotFoundError(
+                    f"CSV file for ticker {ticker} not found at {path}"
+                )
+
             df = pd.read_csv(path, parse_dates=[0], index_col=0)
-            self.data_frames_full[t] = df
-            self.data_frames[t] = df.loc[self.start:self.end]
+            df.index = pd.to_datetime(df.index).normalize()
+            df.sort_index(inplace=True)
 
-        # Common trading dates
-        common = set.intersection(*[set(df.index.normalize()) for df in self.data_frames.values()])
-        self.dates = sorted(common)
+            self.data_frames_full[ticker] = df
+            self.data_frames[ticker] = df.loc[self.start : self.end]
 
-        # Next common date after end for labeling
-        after_sets = [set(df.index.normalize()[df.index.normalize() > self.end]) for df in self.data_frames_full.values()]
-        common_after = set.intersection(*after_sets)
-        self.next_day = min(common_after) if common_after else None
+        common_dates = self._compute_common_dates()
+        if len(common_dates) < self.window:
+            raise ValueError(
+                "Insufficient overlapping data to construct the requested window"
+            )
 
-        # Stack raw features: shape (n_dates, N, F)
-        feature_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-        self.features = np.stack([self.data_frames[t][feature_cols].values for t in self.tickers], axis=1)
+        self.dates = sorted(common_dates)
+        self.date_to_index = {date: idx for idx, date in enumerate(self.dates)}
+        self.next_day = self._compute_next_day()
 
-        # Prepare output
-        out_dir = os.path.join(dest, f"{market}_{mode}_{self.start.date()}_{self.end.date()}_{window}")
-        os.makedirs(out_dir, exist_ok=True)
+        self.features = self._stack_features(self.dates)
 
-        # Build if missing
-        total = len(self.dates) - window + (1 if self.next_day else 0)
-        if not all(os.path.exists(os.path.join(out_dir, f"graph_{i}.pt")) for i in range(total)):
-            self._build_graphs(out_dir)
-
-    def __len__(self):
-        return len(self.dates) - self.window + (1 if self.next_day else 0)
-
-    def __getitem__(self, idx):
-        path = os.path.join(
+        self.output_directory = os.path.join(
             self.dest,
             f"{self.market}_{self.mode}_{self.start.date()}_{self.end.date()}_{self.window}",
-            f"graph_{idx}.pt"
         )
+        os.makedirs(self.output_directory, exist_ok=True)
+
+        self._ensure_serialized_graphs()
+
+    # ------------------------------------------------------------------
+    # Dataset protocol
+    # ------------------------------------------------------------------
+    def __len__(self) -> int:  # type: ignore[override]
+        total = len(self.dates) - self.window
+        if self.next_day is not None:
+            total += 1
+        return max(total, 0)
+
+    def __getitem__(self, index: int) -> Dict[str, Tensor]:  # type: ignore[override]
+        path = os.path.join(self.output_directory, f"graph_{index}.pt")
+        if not os.path.exists(path):
+            raise IndexError(f"Serialized sample {index} is missing at {path}")
         return torch.load(path)
 
+    # ------------------------------------------------------------------
+    # Data preparation helpers
+    # ------------------------------------------------------------------
+    def _compute_common_dates(self) -> set[pd.Timestamp]:
+        common_dates: Optional[set[pd.Timestamp]] = None
+        for frame in self.data_frames.values():
+            dates = set(frame.index)
+            common_dates = dates if common_dates is None else common_dates & dates
+        return common_dates or set()
+
+    def _compute_next_day(self) -> Optional[pd.Timestamp]:
+        candidates: Optional[set[pd.Timestamp]] = None
+        for frame in self.data_frames_full.values():
+            future_dates = set(frame.index[frame.index > self.end])
+            candidates = future_dates if candidates is None else candidates & future_dates
+        return min(candidates) if candidates else None
+
+    def _stack_features(self, dates: Iterable[pd.Timestamp]) -> np.ndarray:
+        dates_index = pd.DatetimeIndex(list(dates))
+        aligned_arrays = []
+        for ticker in self.tickers:
+            aligned = (
+                self.data_frames[ticker]
+                .reindex(dates_index)
+                [self.feature_columns]
+                .to_numpy(dtype=np.float64)
+            )
+            aligned_arrays.append(aligned)
+        return np.stack(aligned_arrays, axis=1)
+
+    # ------------------------------------------------------------------
+    # Graph construction
+    # ------------------------------------------------------------------
     @staticmethod
     def _entropy(arr: np.ndarray) -> float:
-        vals, counts = np.unique(arr, return_counts=True)
-        p = counts / counts.sum()
-        return -np.sum(p * np.log(p + 1e-12))
+        values, counts = np.unique(arr, return_counts=True)
+        probabilities = counts / counts.sum()
+        return float(-np.sum(probabilities * np.log(probabilities + 1e-12)))
 
-    def _adjacency(self, X: np.ndarray) -> torch.Tensor:
-        """
-        Build adjacency from precomputed feature matrix X (N, T*F).
-        Uses entropy-energy and optional heat diffusion.
-        """
-        N = X.shape[0]
-        energy = np.einsum('ij,ij->i', X, X)
-        entropy = np.apply_along_axis(self._entropy, 1, X)
-        e_ratio = energy[:, None] / (energy[None, :] + self.log_eps)
-        ent_sum = entropy[:, None] + entropy[None, :]
+    def _adjacency(self, features: np.ndarray) -> Tensor:
+        """Build an adjacency matrix from flattened node features."""
 
-        # joint entropy
-        X_pair = np.concatenate([
-            X[:, None, :].repeat(N, axis=1),
-            X[None, :, :].repeat(N, axis=0)
-        ], axis=-1)
-        joint_ent = np.apply_along_axis(self._entropy, 2, X_pair)
+        num_nodes = features.shape[0]
+        energy = np.einsum("ij,ij->i", features, features)
+        entropy = np.apply_along_axis(self._entropy, 1, features)
+        energy_ratio = energy[:, None] / (energy[None, :] + self.log_eps)
+        entropy_sum = entropy[:, None] + entropy[None, :]
 
-        A = e_ratio * (np.exp(ent_sum - joint_ent) - 1)
+        tiled_left = np.repeat(features[:, None, :], num_nodes, axis=1)
+        tiled_right = np.repeat(features[None, :, :], num_nodes, axis=0)
+        joint = np.concatenate([tiled_left, tiled_right], axis=-1)
+        joint_entropy = np.apply_along_axis(self._entropy, 2, joint)
+
+        adjacency = energy_ratio * (np.exp(entropy_sum - joint_entropy) - 1.0)
 
         if self.fast_approx:
-            A_t = A + np.eye(N)
-            D_inv_sqrt = np.diag(1.0 / np.sqrt(A_t.sum(axis=1) + self.log_eps))
-            H = D_inv_sqrt @ A_t @ D_inv_sqrt
-            A = expm(-self.heat_tau * (np.eye(N) - H))
+            adjacency_with_self = adjacency + np.eye(num_nodes)
+            degree_inv = 1.0 / np.sqrt(adjacency_with_self.sum(axis=1) + self.log_eps)
+            degree_inv_matrix = np.diag(degree_inv)
+            heat_operator = degree_inv_matrix @ adjacency_with_self @ degree_inv_matrix
+            adjacency = expm(-self.heat_tau * (np.eye(num_nodes) - heat_operator))
         else:
-            A[A < self.sparsify_threshold] = 0.0
-            A = np.log(A + self.log_eps)
+            adjacency[adjacency < self.sparsify_threshold] = 0.0
+            adjacency = np.log(adjacency + self.log_eps)
 
-        A = (A + A.T) / 2.0
-        np.fill_diagonal(A, 0.0)
-        return torch.from_numpy(A.astype(np.float32))
+        adjacency = (adjacency + adjacency.T) / 2.0
+        np.fill_diagonal(adjacency, 0.0)
+        return torch.from_numpy(adjacency.astype(np.float32))
 
-    def _build_graphs(self, out_dir: str):
-        feature_cols = ['Open', 'High', 'Low', 'Close', 'Volume']
-        n = len(self.dates)
-        for i in range(n - self.window + (1 if self.next_day else 0)):
-            # select dates
-            if i < len(self.dates) - self.window:
-                slice_dates = self.dates[i:i+self.window+1]
-            else:
-                slice_dates = self.dates[-self.window:] + [self.next_day]
+    def _ensure_serialized_graphs(self) -> None:
+        total = len(self)
+        if total == 0:
+            return
+        missing = any(
+            not os.path.exists(os.path.join(self.output_directory, f"graph_{i}.pt"))
+            for i in range(total)
+        )
+        if missing:
+            self._build_graphs()
 
-            # collect slices
-            data = []
-            for d in slice_dates:
-                if d in self.dates:
-                    idx = self.dates.index(d)
-                    data.append(self.features[idx])
-                else:
-                    rows = [self.data_frames_full[t].loc[d, feature_cols].values for t in self.tickers]
-                    data.append(np.stack(rows, axis=0))
-            slice_arr = np.stack(data, axis=0)  # (T+1, N, F)
+    def _build_graphs(self) -> None:
+        total = len(self)
+        for index in range(total):
+            dates = self._select_dates(index)
+            slice_array = self._collect_slice(dates)
 
-            # label
-            closes = slice_arr[:,:,3]
-            Y = (closes[-1]>closes[-2]).astype(np.int64)
+            closes = slice_array[:, :, 3]
+            labels = (closes[-1] > closes[-2]).astype(np.int64)
 
-            # features: log1p
-            W = slice_arr[:-1]
-            N = W.shape[1]
-            X_norm = np.log1p(W.transpose(1,0,2).reshape(N,-1))
+            window_array = slice_array[:-1]
+            num_nodes = window_array.shape[1]
+            flattened = np.log1p(
+                window_array.transpose(1, 0, 2).reshape(num_nodes, -1) + self.norm_eps
+            )
 
-            # adjacency from normalized X
-            A = self._adjacency(X_norm)
-            X = torch.from_numpy(X_norm.astype(np.float32))
+            adjacency = self._adjacency(flattened)
+            features = torch.from_numpy(flattened.astype(np.float32))
 
-            torch.save({'X':X,'A':A,'Y':torch.from_numpy(Y)}, os.path.join(out_dir,f"graph_{i}.pt"))
+            payload = {
+                "X": features,
+                "A": adjacency,
+                "Y": torch.from_numpy(labels),
+            }
+            torch.save(payload, os.path.join(self.output_directory, f"graph_{index}.pt"))
+
+    # ------------------------------------------------------------------
+    # Window helpers
+    # ------------------------------------------------------------------
+    def _select_dates(self, index: int) -> List[pd.Timestamp]:
+        in_range = len(self.dates) - self.window
+        if index < in_range:
+            return self.dates[index : index + self.window + 1]
+        if self.next_day is None:
+            raise IndexError("Index exceeds available windows")
+        return self.dates[-self.window :] + [self.next_day]
+
+    def _collect_slice(self, dates: List[pd.Timestamp]) -> np.ndarray:
+        slices = []
+        for date in dates:
+            if date in self.date_to_index:
+                slices.append(self.features[self.date_to_index[date]])
+                continue
+            rows = [
+                self.data_frames_full[ticker]
+                .loc[date, self.feature_columns]
+                .to_numpy(dtype=np.float64)
+                for ticker in self.tickers
+            ]
+            slices.append(np.stack(rows, axis=0))
+        return np.stack(slices, axis=0)
 
