@@ -1,68 +1,102 @@
+"""Dynamic Graph Diffusion Neural Network building blocks."""
+
+from typing import Sequence
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
-from ggd import GeneralizedGraphDiffusion
-from catattn import CatMultiAttn
+
+if __package__ in (None, ""):
+    from ggd import GeneralizedGraphDiffusion  # type: ignore
+    from catattn import CatMultiAttn  # type: ignore
+else:  # pragma: no cover - executed only when imported as a package
+    from .ggd import GeneralizedGraphDiffusion
+    from .catattn import CatMultiAttn
 
 
 class DGDNN(nn.Module):
+    """Dynamic Graph Diffusion Neural Network.
+
+    The network alternates between diffusion layers, which propagate information
+    over learned diffusion bases, and attention layers, which fuse the diffused
+    representation with a persistent skip connection.  The output is a per-node
+    classification logit vector.
+    """
+
     def __init__(
         self,
-        diffusion_size: list,     # e.g., [F0, F1, F2]
-        embedding_size: list,     # e.g., [F1+F1, E1, E1+F2, E2, ...]
+        diffusion_size: Sequence[int],
+        embedding_size: Sequence[int],
         embedding_hidden_size: int,
         embedding_output_size: int,
         raw_feature_size: int,
         classes: int,
         layers: int,
         num_nodes: int,
-        expansion_step: int,      # number of diffusion basis per layer
+        expansion_step: int,
         num_heads: int,
-        active: list              # bool per layer
-    ):
+        active: Sequence[bool],
+    ) -> None:
         super().__init__()
-        assert len(diffusion_size) - 1 == layers, "diffusion_size length must equal layers + 1"
-        assert len(embedding_size) == layers, "embedding_size length must equal layers"
 
-        # Transition matrices and weights
+        if len(diffusion_size) - 1 != layers:
+            raise ValueError("diffusion_size length must be equal to layers + 1")
+        if len(embedding_size) != layers:
+            raise ValueError("embedding_size length must equal the number of layers")
+        if len(active) != layers:
+            raise ValueError("active mask must specify one flag per layer")
+
+        self.layers = layers
+        self.expansion_step = expansion_step
+
+        # Transition matrices (diffusion bases) and convex combination weights.
         self.T = nn.Parameter(torch.empty(layers, expansion_step, num_nodes, num_nodes))
         self.theta = nn.Parameter(torch.empty(layers, expansion_step))
 
-        # Graph diffusion layers
-        self.diffusion_layers = nn.ModuleList([
-            GeneralizedGraphDiffusion(
-                input_dim=diffusion_size[i],
-                output_dim=diffusion_size[i+1],
-                active=active[i]
-            ) for i in range(layers)
-        ])
+        # Graph diffusion stages.
+        self.diffusion_layers = nn.ModuleList(
+            [
+                GeneralizedGraphDiffusion(
+                    input_dim=diffusion_size[i],
+                    output_dim=diffusion_size[i + 1],
+                    active=active[i],
+                )
+                for i in range(layers)
+            ]
+        )
 
-        # Self-attention layers over concatenated feature matrices
-        self.cat_attn_layers = nn.ModuleList([
-            CatMultiAttn(
-                input_time=embedding_size[i],
-                num_heads=num_heads,
-                hidden_dim=embedding_hidden_size,
-                output_dim=embedding_output_size,
-                use_activation=active[i]
-            ) for i in range(layers)
-        ])
+        # Self-attention fusion after each diffusion step.
+        self.cat_attn_layers = nn.ModuleList(
+            [
+                CatMultiAttn(
+                    input_time=embedding_size[i],
+                    num_heads=num_heads,
+                    hidden_dim=embedding_hidden_size,
+                    output_dim=embedding_output_size,
+                    use_activation=active[i],
+                )
+                for i in range(layers)
+            ]
+        )
 
-        # Transform raw features to match embedding_output_size
+        # Project raw node descriptors so that the first attention block can fuse
+        # them with the diffused representation.
         self.raw_h_prime = nn.Linear(diffusion_size[0], raw_feature_size)
 
-        # Final classifier
+        # Final classifier operating on the fused embedding.
         self.linear = nn.Linear(embedding_output_size, classes)
 
-        # Initialize transition parameters
-        self._init_transition_params()
+        self.reset_parameters()
 
-    def _init_transition_params(self):
-        # Xavier init for transition matrices
+    def reset_parameters(self) -> None:
+        """Initialize learnable parameters with sensible defaults."""
+
         nn.init.xavier_uniform_(self.T)
-        # Uniform init for theta so coefficients sum to one
-        nn.init.constant_(self.theta, 1.0 / self.theta.size(-1))
+        nn.init.constant_(self.theta, 1.0 / float(self.theta.size(-1)))
+        nn.init.xavier_uniform_(self.linear.weight)
+        if self.linear.bias is not None:
+            nn.init.zeros_(self.linear.bias)
 
     def forward(self, X: Tensor, A: Tensor) -> Tensor:
         """
@@ -72,29 +106,32 @@ class DGDNN(nn.Module):
         Returns:
             logits: [N, classes]
         """
-        N = X.size(0)
+        if X.dim() != 2 or A.dim() != 2:
+            raise ValueError("X and A must both be 2-D tensors")
+        if A.size(0) != A.size(1):
+            raise ValueError("Adjacency matrix A must be square")
+        if A.size(0) != X.size(0):
+            raise ValueError("Adjacency size must match the number of nodes in X")
+
         theta_soft = F.softmax(self.theta, dim=-1)  # [layers, expansion_step]
 
-        # Initial representations
-        h = X.clone()
-        h_prime = X.clone()
+        h = X
+        h_prime = X
 
-        for l in range(len(self.diffusion_layers)):
-            # Diffusion step
-            t_l = theta_soft[l]            # [expansion_step]
-            T_l = self.T[l]               # [expansion_step, N, N]
-            h = self.diffusion_layers[l](t_l, T_l, h, A)  # [N, F_{l+1}]
+        for layer_idx in range(self.layers):
+            diffusion = self.diffusion_layers[layer_idx]
+            attn = self.cat_attn_layers[layer_idx]
 
-            # Attention fusion
-            if l == 0:
-                # project raw input features for first fusion
-                h_prime = self.cat_attn_layers[l](h, self.raw_h_prime(X))  # [N, E]
+            coefficients = theta_soft[layer_idx]
+            bases = self.T[layer_idx]
+            h = diffusion(coefficients, bases, h, A)
+
+            if layer_idx == 0:
+                h_prime = attn(h, self.raw_h_prime(X))
             else:
-                h_prime = h_prime + self.cat_attn_layers[l](h, h_prime)
+                h_prime = h_prime + attn(h, h_prime)
 
-        # Classification
-        logits = self.linear(h_prime)
-        return logits
+        return self.linear(h_prime)
 
 
 

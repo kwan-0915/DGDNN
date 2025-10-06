@@ -1,65 +1,86 @@
+"""Concatenation-based multi-head attention utilities."""
+
 import torch
 import torch.nn as nn
 from torch import Tensor
 
 
 class CatMultiAttn(nn.Module):
+    """Applies multi-head self-attention over concatenated feature streams.
+
+    The module is intentionally lightweight: each node (or sample) is treated as a
+    token whose embedding corresponds to the concatenation of two temporal
+    descriptors.  The attention mechanism mixes information across nodes while the
+    projection network optionally applies a non-linearity and adjusts the channel
+    dimensionality.
+    """
+
     def __init__(
         self,
-        input_time: int,       # T1 + T2
+        input_time: int,
         num_heads: int,
         hidden_dim: int,
         output_dim: int,
-        use_activation: bool
-    ):
-        """
-        Args:
-            input_time (int): Combined time dimension after concatenation (T1 + T2)
-            num_heads (int): Number of attention heads
-            hidden_dim (int): Hidden output dimension (E_h)
-            output_dim (int): Final projection dimension
-            use_activation (bool): Whether to apply GELU activation
-        """
-        super().__init__()
-        self.use_activation = use_activation
+        use_activation: bool,
+    ) -> None:
+        """Construct the concatenation attention block.
 
-        # Multi-head attention: treating each series as a token
-        # Sequence length L = number of series (N), embed_dim = input_time
+        Args:
+            input_time: Combined temporal dimension after concatenation ``T1 + T2``.
+            num_heads: Number of attention heads.  Must divide ``input_time``.
+            hidden_dim: Hidden size of the projection multilayer perceptron.
+            output_dim: Output dimensionality returned by the block.
+            use_activation: Whether to apply a :class:`~torch.nn.GELU` activation
+                between the projection layers.
+        """
+
+        super().__init__()
+        if input_time % num_heads != 0:
+            raise ValueError(
+                "input_time must be divisible by num_heads for MultiheadAttention"
+            )
+
+        # Multi-head attention treats every node as a token; the actual batch size
+        # is handled by temporarily unsqueezing the sequence tensor.
         self.attn = nn.MultiheadAttention(embed_dim=input_time, num_heads=num_heads)
         self.norm = nn.LayerNorm(input_time)
 
-        # Projection network
+        # Projection from the concatenated representation to the downstream space.
         self.proj = nn.Sequential(
             nn.Linear(input_time, hidden_dim),
             nn.GELU() if use_activation else nn.Identity(),
-            nn.Linear(hidden_dim, output_dim)
+            nn.Linear(hidden_dim, output_dim),
         )
 
+    def _prepare_inputs(self, h: Tensor, h_prime: Tensor) -> Tensor:
+        """Validate and concatenate the two feature streams."""
+
+        if h.shape[0] != h_prime.shape[0]:
+            raise ValueError("Both inputs must contain the same number of nodes")
+        if h.dim() != 2 or h_prime.dim() != 2:
+            raise ValueError("Inputs to CatMultiAttn must be two-dimensional tensors")
+
+        concatenated = torch.cat([h, h_prime], dim=1)
+        return concatenated.unsqueeze(1)  # (N, 1, input_time)
+
     def forward(self, h: Tensor, h_prime: Tensor) -> Tensor:
-        """
+        """Fuse the provided representations.
+
         Args:
-            h (Tensor): shape [N, T1]  — features for each of N series over T1 time
-            h_prime (Tensor): shape [N, T2]  — additional features over T2 time
+            h: A ``[N, T1]`` tensor representing the primary features for each node.
+            h_prime: A ``[N, T2]`` tensor containing auxiliary features.
 
         Returns:
-            Tensor: shape [N, output_dim] — per-series representation after attention + projection
+            ``[N, output_dim]`` tensor describing the refined node representations.
         """
-        # Ensure same batch of series
-        assert h.shape[0] == h_prime.shape[0], "Number of series (N) must match."
 
-        # Concatenate along time dimension => [N, T1+T2]
-        x = torch.cat([h, h_prime], dim=1)
+        sequence = self._prepare_inputs(h, h_prime)
 
-        # Treat each series as a token: reshape to (L=N, batch=1, E=input_time)
-        x = x.unsqueeze(1)  # [N, 1, input_time]
+        # Run self-attention on the concatenated representation.  The same tensor is
+        # used as query/key/value because we only need self-attention here.
+        attended, _ = self.attn(sequence, sequence, sequence)
+        attended = self.norm(attended)
 
-        # Multi-head attention across series dimension
-        attn_out, _ = self.attn(x, x, x)  # [L=N, 1, E]
-        attn_out = self.norm(attn_out)    # LayerNorm over last dim
-
-        # Remove batch dimension => [N, E]
-        x = attn_out.squeeze(1)
-
-        # Project to output dimension
-        x = self.proj(x)  # [N, output_dim]
-        return x
+        # Remove the artificial batch dimension introduced earlier and project.
+        fused = attended.squeeze(1)
+        return self.proj(fused)
